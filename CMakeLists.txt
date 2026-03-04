@@ -1,0 +1,66 @@
+cmake_minimum_required(VERSION 3.20)
+project(papercraft VERSION 1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    add_compile_options(-O3 -march=native -DNDEBUG -funroll-loops)
+else()
+    add_compile_options(-g -O0)
+endif()
+
+find_package(OpenMesh REQUIRED)
+find_package(Eigen3 REQUIRED)
+
+find_package(OpenMP)
+if(NOT OpenMP_CXX_FOUND)
+    message(WARNING "OpenMP not found - parallel unfolding disabled")
+endif()
+
+include(FetchContent)
+FetchContent_Declare(nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    TRUE)
+FetchContent_MakeAvailable(nlohmann_json)
+
+FetchContent_Declare(stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG        master
+    GIT_SHALLOW    TRUE)
+FetchContent_MakeAvailable(stb)
+
+file(GLOB SOURCES "src/*.cpp")
+
+add_executable(papercraft ${SOURCES})
+
+target_include_directories(papercraft PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${stb_SOURCE_DIR}
+)
+
+# Suppress warnings for OpenMesh system headers
+target_include_directories(papercraft SYSTEM PRIVATE
+    ${OPENMESH_INCLUDE_DIRS}
+)
+
+target_link_libraries(papercraft PRIVATE
+    OpenMeshCore
+    OpenMeshTools
+    Eigen3::Eigen
+    nlohmann_json::nlohmann_json
+)
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(papercraft PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+install(TARGETS papercraft DESTINATION bin)
+
+message(STATUS "=== Papercraft Pipeline Configuration ===")
+message(STATUS "  OpenMesh:    found")
+message(STATUS "  Eigen3:      ${EIGEN3_VERSION}")
+message(STATUS "  OpenMP:      ${OpenMP_CXX_FOUND}")
+message(STATUS "  Build type:  ${CMAKE_BUILD_TYPE}")
+message(STATUS "=========================================")

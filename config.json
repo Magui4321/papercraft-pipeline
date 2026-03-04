@@ -1,0 +1,17 @@
+{
+    "output_dir": "outputs",
+    "target_face_count": 2000,
+    "n_patches": 0,
+    "dihedral_weight": 1.0,
+    "distortion_weight": 0.5,
+    "fold_angle_thresh": 30.0,
+    "fold_preserve_ratio": 0.80,
+    "tab_width_mm": 3.0,
+    "max_distortion_warn": 0.25,
+    "sheet_dpi": 300,
+    "sheet_w_mm": 210.0,
+    "sheet_h_mm": 297.0,
+    "threads": 0,
+    "verbose": false,
+    "dry_run": false
+}
