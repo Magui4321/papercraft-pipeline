@@ -209,7 +209,7 @@ double compute_arap_proxy(const Eigen::MatrixXd& V,
         Eigen::Vector3d e0=V.row(b)-V.row(a), e1=V.row(c)-V.row(a);
         double a3d=0.5*e0.cross(e1).norm();
         Eigen::Vector2d u0=UV.row(b)-UV.row(a), u1=UV.row(c)-UV.row(a);
-        double a2d=0.5*std::abs(u0.x()*u1.y()-u0.y()*u1.x());
+        double a2d=0.5*std::abs(u0(0)*u1(1)-u0(1)*u1(0));
         if(a3d<1e-14) continue;
         double ratio=a2d/(a3d+1e-14);
         if(ratio<1e-12) ratio=1e-12;

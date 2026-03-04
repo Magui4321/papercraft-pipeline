@@ -292,9 +292,9 @@ void render_sheet_png(const std::vector<UnfoldResult>& results,
         int page_idx = it->second;
 
         auto off = page.offsets[page_idx];
-        auto t=[&](Eigen::Vector2d p)->Eigen::Vector2d{ return p+off; };
+        auto translate=[&](Eigen::Vector2d p)->Eigen::Vector2d{ return p+off; };
 
-        auto p0=t(tab.p0), p1=t(tab.p1), t0=t(tab.t0), t1=t(tab.t1);
+        auto p0=translate(tab.p0), p1=translate(tab.p1), t0=translate(tab.t0), t1=translate(tab.t1);
 
         // Outline the tab trapezoid in dark grey
         draw_line(p0.x(),p0.y(),p1.x(),p1.y(),100,100,100);

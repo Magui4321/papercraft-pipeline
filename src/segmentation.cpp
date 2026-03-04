@@ -356,7 +356,8 @@ void ensure_disk_topology(Patch& patch, const PaperMesh& /*orig_mesh*/)
     // Count boundary loops
     std::unordered_set<int> visited;
     int loops = 0;
-    for (auto& [start, _] : boundary_next) {
+    for (auto& [start, next_vertex] : boundary_next) {
+        (void)next_vertex;
         if (visited.count(start)) continue;
         int cur = start;
         do { visited.insert(cur); cur = boundary_next.count(cur) ? boundary_next.at(cur) : cur; }
