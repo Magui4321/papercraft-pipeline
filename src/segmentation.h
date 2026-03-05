@@ -5,9 +5,11 @@
  */
 
 #include "mesh_loader.h"
+#include "simplification.h"
 #include "config.h"
 
 #include <vector>
+#include <string>
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 
@@ -23,19 +25,63 @@ struct Patch {
 };
 
 /**
- * @brief Build a weighted face-adjacency matrix.
+ * @brief Aggregated result from the spectral segmentation stage.
+ */
+struct SegmentationResult {
+    std::vector<Patch>  patches;
+    std::vector<int>    face_labels;       ///< Per-face cluster label (size == nF of input mesh)
+    int                 k_chosen           = 0;
+    double              distortion_proxy_at_k = 0.0;
+    std::vector<double> elbow_curve;       ///< Distortion values for k = 2, 3, …
+    double              elapsed_ms         = 0.0;
+
+    /** @brief Pretty-print a summary to stdout. */
+    void print() const;
+
+    /** @brief Serialise to a JSON file. */
+    void save_json(const std::string& path) const;
+};
+
+/**
+ * @brief Build a weighted face-adjacency matrix from a FoldEdgeSet.
  *
  * Interior edge weight is @p dihedral_weight for fold edges and 1.0 otherwise.
  *
  * @param mesh             Input mesh.
- * @param fold_edges       Edges classified as folds.
+ * @param fold_edges       FoldEdgeSet (uses edge_indices internally).
  * @param dihedral_weight  Weight assigned to fold edges.
  * @return Symmetric sparse adjacency matrix of size nF × nF.
  */
 Eigen::SparseMatrix<double>
 build_face_adjacency_matrix(const PaperMesh& mesh,
+                             const FoldEdgeSet& fold_edges,
+                             double dihedral_weight);
+
+/**
+ * @brief Overload accepting a plain vector of edge handles (kept for compatibility).
+ */
+Eigen::SparseMatrix<double>
+build_face_adjacency_matrix(const PaperMesh& mesh,
                              const std::vector<OpenMesh::EdgeHandle>& fold_edges,
                              double dihedral_weight);
+
+/**
+ * @brief Build a face-adjacency matrix for a LOCAL patch (subset of faces).
+ *
+ * Rows/columns are indexed 0…(patch.face_indices.size()-1) rather than
+ * global face indices.  Used for Fiedler-vector bisection in unfolding.
+ *
+ * @param mesh             Original mesh.
+ * @param patch            Patch whose faces to consider.
+ * @param fold_edges       Global fold-edge set.
+ * @param dihedral_weight  Weight assigned to fold edges.
+ * @return Symmetric sparse adjacency matrix of size |patch.face_indices| × |patch.face_indices|.
+ */
+Eigen::SparseMatrix<double>
+build_local_face_adjacency(const PaperMesh& mesh,
+                            const Patch& patch,
+                            const FoldEdgeSet& fold_edges,
+                            double dihedral_weight);
 
 /**
  * @brief Compute spectral embedding of faces via the normalised graph Laplacian.
@@ -45,6 +91,17 @@ build_face_adjacency_matrix(const PaperMesh& mesh,
  */
 Eigen::MatrixXd
 compute_spectral_embedding(const Eigen::SparseMatrix<double>& adj, int k);
+
+/**
+ * @brief Compute only the Fiedler vector (2nd eigenvector of normalised Laplacian).
+ *
+ * This is used for binary bisection of a patch during iterative unfolding.
+ *
+ * @param adj  Local face adjacency matrix.
+ * @return Fiedler vector (eigenvector corresponding to 2nd smallest eigenvalue).
+ */
+Eigen::VectorXd
+compute_fiedler_vector(const Eigen::SparseMatrix<double>& adj);
 
 /**
  * @brief K-means clustering with k-means++ initialisation (Lloyd's algorithm).
@@ -78,12 +135,12 @@ int find_elbow(const std::vector<double>& distortions);
  * @brief Full segmentation pipeline: spectral embedding → k-means → patches.
  * @param mesh        Input (simplified) mesh.
  * @param cfg         Pipeline configuration.
- * @param fold_edges  Fold edges for adjacency weighting.
- * @return Vector of Patch objects.
+ * @param fold_edges  Fold-edge set for adjacency weighting.
+ * @return SegmentationResult containing patches, labels, chosen k, and metrics.
  */
-std::vector<Patch>
+SegmentationResult
 segment_mesh(const PaperMesh& mesh, const Config& cfg,
-             const std::vector<OpenMesh::EdgeHandle>& fold_edges);
+             const FoldEdgeSet& fold_edges);
 
 /**
  * @brief Ensure a patch has disk topology (exactly one boundary loop).

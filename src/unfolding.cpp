@@ -1,6 +1,7 @@
 /**
  * @file unfolding.cpp
- * @brief LSCM UV unfolding implementation from scratch.
+ * @brief LSCM UV unfolding implementation from scratch,
+ *        with Iterative Hierarchical Splitting for high-distortion patches.
  */
 
 #include "unfolding.h"
@@ -11,18 +12,23 @@
 #include <Eigen/SparseCholesky>
 
 #include <stb_image_write.h>
+#include <nlohmann/json.hpp>
 
 #include <map>
 #include <set>
+#include <queue>
+#include <fstream>
 #include <vector>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <chrono>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // planar_projection  (PCA best-fit plane)
@@ -220,40 +226,218 @@ double compute_arap_proxy(const Eigen::MatrixXd& V,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// unfold_patches
+// UnfoldingResult helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::vector<UnfoldResult>
-unfold_patches(const std::vector<Patch>& patches, const Config& cfg)
+void UnfoldingResult::print() const
 {
-    int n=static_cast<int>(patches.size());
-    std::vector<UnfoldResult> results(n);
+    std::cout << "[Stage 4] LSCM UV unfolding (Iterative Hierarchical Splitting)\n"
+              << "  total patches      : " << patches.size() << "\n"
+              << "  patches split      : " << patches_split << "\n"
+              << "  patches fallback   : " << patches_using_fallback << "\n"
+              << "  elapsed ms         : " << elapsed_ms << "\n";
+}
 
-#ifdef _OPENMP
-    int threads = cfg.threads > 0 ? cfg.threads : omp_get_max_threads();
-    omp_set_num_threads(threads);
-    #pragma omp parallel for schedule(dynamic)
-#else
-    (void)cfg;
-#endif
-    for (int i=0;i<n;i++){
-        const Patch& p=patches[i];
-        UnfoldResult r;
-        r.patch_id=p.id;
-        r.V=p.V;
-        r.F=p.F;
+void UnfoldingResult::save_json(const std::string& path) const
+{
+    nlohmann::json j;
+    j["total_patches"]         = patches.size();
+    j["patches_split"]         = patches_split;
+    j["patches_using_fallback"] = patches_using_fallback;
+    j["elapsed_ms"]            = elapsed_ms;
+    std::ofstream f(path);
+    if (f.is_open()) f << j.dump(2);
+}
 
-        if (p.V.rows()<3||p.F.rows()<1){
-            r.UV=Eigen::MatrixXd::Zero(p.V.rows(),2);
-        } else {
-            r.UV=lscm_eigen(p.V, p.F);
-            if (r.UV.rows()!=p.V.rows())
-                r.UV=planar_projection(p.V,p.F);
-        }
-        r.distortion=compute_arap_proxy(r.V, r.F, r.UV);
-        results[i]=std::move(r);
+// ─────────────────────────────────────────────────────────────────────────────
+// unfold_patches  — Queue-based Iterative Hierarchical Splitting
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @brief Helper: bisect a patch using the Fiedler vector of its local
+ *        face-adjacency graph.
+ *
+ * @param mesh      Original mesh (for adjacency lookup).
+ * @param patch     Patch to bisect.
+ * @param fold_edges  Global fold-edge set for weighted adjacency.
+ * @param cfg       Pipeline configuration.
+ * @param next_id   Next available patch ID (incremented on return).
+ * @param[out] left   Faces with Fiedler value <= median.
+ * @param[out] right  Faces with Fiedler value > median.
+ */
+static void bisect_patch_fiedler(
+    const PaperMesh& mesh,
+    const Patch& patch,
+    const FoldEdgeSet& fold_edges,
+    const Config& cfg,
+    int& next_id,
+    Patch& left,
+    Patch& right)
+{
+    // Build local face adjacency for this patch only
+    auto local_adj = build_local_face_adjacency(mesh, patch, fold_edges,
+                                                 cfg.dihedral_weight);
+
+    // Compute the Fiedler vector
+    Eigen::VectorXd fiedler = compute_fiedler_vector(local_adj);
+
+    // Threshold at median value (proper median for even-sized vectors)
+    Eigen::VectorXd sorted = fiedler;
+    std::sort(sorted.data(), sorted.data() + sorted.size());
+    int sz = static_cast<int>(sorted.size());
+    double median = (sz % 2 == 1)
+                  ? sorted[sz / 2]
+                  : (sorted[sz/2 - 1] + sorted[sz/2]) * 0.5;
+
+    // Split face_indices into two halves
+    // Global-to-local face index map was implicitly built when constructing
+    // local_adj — local index i corresponds to patch.face_indices[i].
+    int nLocal = static_cast<int>(patch.face_indices.size());
+    std::vector<int> left_fi, right_fi;
+    for (int i = 0; i < nLocal; i++) {
+        if (fiedler[i] <= median)
+            left_fi.push_back(patch.face_indices[i]);
+        else
+            right_fi.push_back(patch.face_indices[i]);
     }
-    return results;
+
+    // Ensure both halves are non-empty (degenerate: send all to left, clear right)
+    if (left_fi.empty() || right_fi.empty()) {
+        left  = patch;
+        right.face_indices.clear();
+        right.id = -1; // sentinel: degenerate bisection, do not enqueue
+        return;
+    }
+
+    // Helper to rebuild a Patch from a face index list
+    auto make_patch = [&](std::vector<int>& fids, int id) -> Patch {
+        Patch p;
+        p.id = id;
+        p.face_indices = fids;
+
+        std::unordered_map<int,int> vmap;
+        for (int fi : fids) {
+            auto fh = mesh.face_handle(fi);
+            for (auto fv = mesh.cfv_begin(fh); fv != mesh.cfv_end(fh); ++fv) {
+                int vi = fv->idx();
+                if (!vmap.count(vi)) {
+                    int li = static_cast<int>(vmap.size());
+                    vmap[vi] = li;
+                    p.vertex_indices.push_back(vi);
+                }
+            }
+        }
+
+        int nv = static_cast<int>(p.vertex_indices.size());
+        p.V.resize(nv, 3);
+        for (int i = 0; i < nv; i++) {
+            auto pt = mesh.point(mesh.vertex_handle(p.vertex_indices[i]));
+            p.V.row(i) = Eigen::Vector3d(pt[0], pt[1], pt[2]);
+        }
+
+        int nf = static_cast<int>(fids.size());
+        p.F.resize(nf, 3);
+        for (int fi = 0; fi < nf; fi++) {
+            auto fh = mesh.face_handle(fids[fi]);
+            int col = 0;
+            for (auto fv = mesh.cfv_begin(fh); fv != mesh.cfv_end(fh); ++fv)
+                p.F(fi, col++) = vmap.at(fv->idx());
+        }
+        return p;
+    };
+
+    left  = make_patch(left_fi,  next_id++);
+    right = make_patch(right_fi, next_id++);
+}
+
+UnfoldingResult unfold_patches(const PaperMesh& mesh,
+                                SegmentationResult& seg,
+                                const Config& cfg)
+{
+    using Clock = std::chrono::high_resolution_clock;
+    auto t0 = Clock::now();
+
+    UnfoldingResult result;
+
+    // Re-detect fold edges from the mesh for local adjacency weighting in bisection.
+    // The fold_edges in the simplification result are stored on the simplified mesh;
+    // we need them here for Fiedler-vector adjacency weighting.
+    FoldEdgeSet mesh_fold_edges = detect_fold_edges(mesh, cfg.fold_angle_thresh);
+
+    // Queue-based processing loop
+    std::queue<Patch> q;
+    for (auto& p : seg.patches)
+        q.push(p);
+
+    int next_id = static_cast<int>(seg.patches.size());
+
+    while (!q.empty()) {
+        Patch patch = q.front();
+        q.pop();
+
+        UnfoldResult r;
+        r.patch_id = patch.id;
+        r.V = patch.V;
+        r.F = patch.F;
+
+        // Step 1: attempt LSCM unfolding
+        bool lscm_ok = false;
+        if (patch.V.rows() >= 3 && patch.F.rows() >= 1) {
+            r.UV = lscm_eigen(patch.V, patch.F);
+            lscm_ok = (r.UV.rows() == patch.V.rows());
+        }
+
+        if (!lscm_ok || patch.V.rows() < 3 || patch.F.rows() < 1) {
+            // LSCM failed or patch too small — use planar projection fallback
+            if (patch.V.rows() > 0)
+                r.UV = planar_projection(patch.V, patch.F);
+            else
+                r.UV = Eigen::MatrixXd(0, 2);
+            r.distortion = compute_arap_proxy(r.V, r.F, r.UV);
+            result.patches_using_fallback++;
+            result.patches.push_back(std::move(r));
+            continue;
+        }
+
+        // Step 2: measure ARAP distortion
+        r.distortion = compute_arap_proxy(r.V, r.F, r.UV);
+
+        // Step 3: if distortion too high AND patch is large enough, bisect
+        if (r.distortion > cfg.max_distortion_warn &&
+            static_cast<int>(patch.face_indices.size()) > 4)
+        {
+            std::cout << "[Stage 4] Distortion " << r.distortion
+                      << " exceeds threshold. Bisecting patch "
+                      << patch.id << ".\n";
+
+            Patch left_patch, right_patch;
+            bisect_patch_fiedler(mesh, patch, mesh_fold_edges,
+                                  cfg, next_id, left_patch, right_patch);
+
+            if (!right_patch.face_indices.empty()) {
+                // Update face labels in SegmentationResult so 3D preview matches
+                for (int fi : left_patch.face_indices)
+                    if (fi < static_cast<int>(seg.face_labels.size()))
+                        seg.face_labels[fi] = left_patch.id;
+                for (int fi : right_patch.face_indices)
+                    if (fi < static_cast<int>(seg.face_labels.size()))
+                        seg.face_labels[fi] = right_patch.id;
+
+                q.push(left_patch);
+                q.push(right_patch);
+                result.patches_split++;
+                continue;
+            }
+            // Degenerate bisection: fall through and accept as-is
+        }
+
+        // Step 4: accept the patch
+        result.patches.push_back(std::move(r));
+    }
+
+    auto t1 = Clock::now();
+    result.elapsed_ms = std::chrono::duration<double, std::milli>(t1-t0).count();
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
