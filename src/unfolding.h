@@ -75,6 +75,23 @@ double compute_arap_proxy(const Eigen::MatrixXd& V,
                            const Eigen::MatrixXd& UV);
 
 /**
+ * @brief Normalise UV coordinates so the total 2D UV area matches the total
+ *        3D surface area of the patch.
+ *
+ * LSCM is conformal but not isometric — it produces an arbitrarily scaled
+ * 2D layout.  Calling this function before compute_arap_proxy removes the
+ * global scale mismatch so that the distortion proxy compares areas on the
+ * same scale.
+ *
+ * @param V3  3D vertex positions (nV × 3).
+ * @param F   Face index array (nF × 3).
+ * @param UV  UV coordinates (nV × 2), modified in-place.
+ */
+void normalize_uv_area(const Eigen::MatrixXd& V3,
+                        const Eigen::MatrixXi& F,
+                        Eigen::MatrixXd& UV);
+
+/**
  * @brief Main unfolding driver with Iterative Hierarchical Splitting.
  *
  * Implements a queue-based algorithm:

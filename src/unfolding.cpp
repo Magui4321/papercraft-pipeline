@@ -226,6 +226,38 @@ double compute_arap_proxy(const Eigen::MatrixXd& V,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// normalize_uv_area  (scale UV so total 2D area == total 3D area)
+// ─────────────────────────────────────────────────────────────────────────────
+
+void normalize_uv_area(const Eigen::MatrixXd& V3,
+                        const Eigen::MatrixXi& F,
+                        Eigen::MatrixXd& UV)
+{
+    if (F.rows() == 0) return;
+
+    double area3d = 0.0;
+    for (int f = 0; f < F.rows(); f++) {
+        int a = F(f,0), b = F(f,1), c = F(f,2);
+        Eigen::Vector3d e0 = V3.row(b) - V3.row(a);
+        Eigen::Vector3d e1 = V3.row(c) - V3.row(a);
+        area3d += 0.5 * e0.cross(e1).norm();
+    }
+
+    double area2d = 0.0;
+    for (int f = 0; f < F.rows(); f++) {
+        int a = F(f,0), b = F(f,1), c = F(f,2);
+        Eigen::Vector2d u0 = UV.row(b) - UV.row(a);
+        Eigen::Vector2d u1 = UV.row(c) - UV.row(a);
+        area2d += 0.5 * std::abs(u0(0)*u1(1) - u0(1)*u1(0));
+    }
+
+    if (area2d < 1e-8) return;
+
+    double s = std::sqrt(area3d / area2d);
+    UV *= s;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // UnfoldingResult helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -393,6 +425,7 @@ UnfoldingResult unfold_patches(const PaperMesh& mesh,
                 r.UV = planar_projection(patch.V, patch.F);
             else
                 r.UV = Eigen::MatrixXd(0, 2);
+            normalize_uv_area(r.V, r.F, r.UV);
             r.distortion = compute_arap_proxy(r.V, r.F, r.UV);
             result.patches_using_fallback++;
             result.patches.push_back(std::move(r));
@@ -400,6 +433,7 @@ UnfoldingResult unfold_patches(const PaperMesh& mesh,
         }
 
         // Step 2: measure ARAP distortion
+        normalize_uv_area(r.V, r.F, r.UV);
         r.distortion = compute_arap_proxy(r.V, r.F, r.UV);
 
         // Step 3: if distortion too high AND patch is large enough, bisect
