@@ -1,4 +1,4 @@
-# Text-to-Papercraft Pipeline
+# Papercraft Pipeline
 
 A complete C++17 pipeline that converts a 3D mesh (`.obj`) into printable papercraft sheets (`.png`). The pipeline implements two research contributions: **fold-aware mesh simplification** and **papercraft-aware spectral segmentation**.
 
