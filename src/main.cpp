@@ -7,9 +7,9 @@
  *
  * Pipeline stages:
  *   1. Load & repair mesh
- *   2. Fold-aware simplification
+ *   2. Fold-aware simplification (Constraint-Plane QEM)
  *   3. Spectral segmentation
- *   4. LSCM UV unfolding
+ *   4. LSCM UV unfolding (Iterative Hierarchical Splitting)
  *   5. Sheet layout & tab generation
  *   6. Output PNGs + metrics
  */
@@ -96,35 +96,38 @@ int main(int argc, char** argv)
         render_mesh_png(mesh, cfg.output_dir+"/"+base+"_01_input.png");
 
     // ════════════════════════════════════════════════════════════════════
-    // STAGE 2: Fold-aware simplification
+    // STAGE 2: Fold-aware simplification (Constraint-Plane QEM)
     // ════════════════════════════════════════════════════════════════════
     log(LogLevel::INFO, "Stage 2: Fold-aware simplification → " +
         std::to_string(cfg.target_face_count) + " faces");
     Timer t2;
 
-    double fold_ratio = fold_aware_simplify(mesh, cfg);
-    metrics.fold_preserve   = fold_ratio;
+    auto fold_edges = detect_fold_edges(mesh, cfg.fold_angle_thresh);
+    auto simp       = fold_aware_simplify(mesh, fold_edges, cfg);
+    simp.print();
 
-    auto stats1 = compute_stats(mesh);
+    metrics.fold_preserve   = simp.fold_preservation_ratio;
+    metrics.t_simplify_ms   = t2.elapsed_ms();
+
+    auto stats1 = compute_stats(simp.mesh);
     metrics.simp_vertices = stats1.n_vertices;
     metrics.simp_faces    = stats1.n_faces;
-    metrics.t_simplify_ms = t2.elapsed_ms();
 
-    log_metric("simp_faces",         stats1.n_faces);
-    log_metric("fold_preserve_ratio", fold_ratio);
-
-    auto fold_edges = detect_fold_edges(mesh, cfg.fold_angle_thresh);
-    log_metric("fold_edges", static_cast<double>(fold_edges.size()));
+    log_metric("simp_faces",          stats1.n_faces);
+    log_metric("fold_preserve_ratio", simp.fold_preservation_ratio);
+    log_metric("fold_edges",          static_cast<double>(simp.fold_edges.total_detected));
 
     if (!cfg.dry_run) {
-        render_foldlines_png(mesh, fold_edges,
-                             cfg.output_dir+"/"+base+"_02_folds.png");
-        save_mesh(mesh, cfg.output_dir+"/"+base+"_simplified.obj");
+        simp.save_metrics_json(cfg.output_dir + "/stage2_metrics.json");
+        simp.fold_edges.save_json(cfg.output_dir + "/stage2_fold_edges.json");
+        render_foldlines_png(simp.mesh, simp.fold_edges,
+                             cfg.output_dir + "/stage2_foldlines.png");
+        save_mesh(simp.mesh, cfg.output_dir+"/"+base+"_simplified.obj");
     }
 
-    if (fold_ratio < cfg.fold_preserve_ratio)
+    if (simp.fold_preservation_ratio < cfg.fold_preserve_ratio)
         log(LogLevel::WARNING, "Fold preservation ratio below threshold: " +
-            std::to_string(fold_ratio));
+            std::to_string(simp.fold_preservation_ratio));
 
     // ════════════════════════════════════════════════════════════════════
     // STAGE 3: Spectral segmentation
@@ -132,41 +135,45 @@ int main(int argc, char** argv)
     log(LogLevel::INFO, "Stage 3: Spectral segmentation");
     Timer t3;
 
-    auto patches = segment_mesh(mesh, cfg, fold_edges);
-    metrics.n_patches    = static_cast<int>(patches.size());
+    auto seg = segment_mesh(simp.mesh, cfg, simp.fold_edges);
+    seg.print();
+
+    metrics.n_patches    = static_cast<int>(seg.patches.size());
     metrics.t_segment_ms = t3.elapsed_ms();
 
-    log_metric("n_patches", static_cast<double>(patches.size()));
+    log_metric("n_patches", static_cast<double>(seg.patches.size()));
 
-    if (!cfg.dry_run)
-        render_patches_png(mesh, patches,
+    if (!cfg.dry_run) {
+        seg.save_json(cfg.output_dir + "/stage3_metrics.json");
+        render_patches_png(simp.mesh, seg.patches,
                            cfg.output_dir+"/"+base+"_03_patches.png");
+    }
 
     // ════════════════════════════════════════════════════════════════════
-    // STAGE 4: LSCM UV unfolding
+    // STAGE 4: LSCM UV unfolding (Iterative Hierarchical Splitting)
     // ════════════════════════════════════════════════════════════════════
     log(LogLevel::INFO, "Stage 4: LSCM UV unfolding");
     Timer t4;
 
-    auto unfold_results = unfold_patches(patches, cfg);
+    auto unfold = unfold_patches(simp.mesh, seg, cfg);
+    unfold.print();
+
     metrics.t_unfold_ms = t4.elapsed_ms();
 
     std::vector<double> distortions;
-    for (auto& r : unfold_results) {
+    for (auto& r : unfold.patches) {
         distortions.push_back(r.distortion);
-        if (r.distortion > cfg.max_distortion_warn)
-            log(LogLevel::WARNING, "Patch " + std::to_string(r.patch_id) +
-                " distortion " + std::to_string(r.distortion) +
-                " > threshold " + std::to_string(cfg.max_distortion_warn));
     }
     build_pipeline_metrics(metrics, distortions);
 
     log_metric("mean_uv_distortion", metrics.mean_distortion);
     log_metric("max_uv_distortion",  metrics.max_distortion);
 
-    if (!cfg.dry_run)
-        render_uv_layout_png(unfold_results,
+    if (!cfg.dry_run) {
+        unfold.save_json(cfg.output_dir + "/stage4_metrics.json");
+        render_uv_layout_png(unfold.patches,
                              cfg.output_dir+"/"+base+"_04_uv.png");
+    }
 
     // ════════════════════════════════════════════════════════════════════
     // STAGE 5: Sheet layout
@@ -174,7 +181,7 @@ int main(int argc, char** argv)
     log(LogLevel::INFO, "Stage 5: Sheet layout & tab generation");
     Timer t5;
 
-    auto pages = generate_sheet(unfold_results, cfg);
+    auto pages = generate_sheet(unfold.patches, cfg);
     metrics.n_pages    = static_cast<int>(pages.size());
     metrics.t_sheet_ms = t5.elapsed_ms();
 
@@ -182,7 +189,7 @@ int main(int argc, char** argv)
 
     // Collect all tabs
     std::vector<Tab> all_tabs;
-    for (auto& r : unfold_results) {
+    for (auto& r : unfold.patches) {
         auto tabs = compute_tabs(r, cfg.tab_width_mm);
         all_tabs.insert(all_tabs.end(), tabs.begin(), tabs.end());
     }
@@ -191,13 +198,13 @@ int main(int argc, char** argv)
         for (auto& page : pages) {
             std::string out = cfg.output_dir+"/"+base+"_05_sheet_p"+
                               std::to_string(page.page_number)+".png";
-            render_sheet_png(unfold_results, all_tabs, page, cfg, out);
+            render_sheet_png(unfold.patches, all_tabs, page, cfg, out);
         }
     }
 
     // Overlap check across all pages
     for (auto& page : pages)
-        if (detect_overlaps(unfold_results, page)) {
+        if (detect_overlaps(unfold.patches, page)) {
             metrics.has_overlaps = true;
             break;
         }

@@ -96,6 +96,15 @@ inline double deg2rad(double deg) {
 }
 
 /**
+ * @brief Convert radians to degrees.
+ * @param rad Angle in radians.
+ * @return Angle in degrees.
+ */
+inline double rad2deg(double rad) {
+    return rad * 180.0 / M_PI;
+}
+
+/**
  * @brief Clamp a value to the closed interval [lo, hi].
  * @tparam T Numeric type.
  * @param val Value to clamp.
