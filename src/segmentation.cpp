@@ -10,8 +10,10 @@
 #include <Eigen/Sparse>
 
 #include <stb_image_write.h>
+#include <nlohmann/json.hpp>
 
 #include <queue>
+#include <fstream>
 #include <unordered_set>
 #include <unordered_map>
 #include <random>
@@ -19,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <chrono>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Palette for patch colouring (20 distinct colours)
@@ -32,7 +35,65 @@ static const uint8_t PATCH_PALETTE[20][3] = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// build_face_adjacency_matrix
+// SegmentationResult helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+void SegmentationResult::print() const
+{
+    std::cout << "[Stage 3] Spectral segmentation\n"
+              << "  k chosen           : " << k_chosen << "\n"
+              << "  distortion at k    : " << distortion_proxy_at_k << "\n"
+              << "  patches            : " << patches.size() << "\n"
+              << "  elapsed ms         : " << elapsed_ms << "\n";
+}
+
+void SegmentationResult::save_json(const std::string& path) const
+{
+    nlohmann::json j;
+    j["k_chosen"]               = k_chosen;
+    j["distortion_proxy_at_k"]  = distortion_proxy_at_k;
+    j["n_patches"]              = patches.size();
+    j["elapsed_ms"]             = elapsed_ms;
+    j["elbow_curve"]            = elbow_curve;
+    std::ofstream f(path);
+    if (f.is_open()) f << j.dump(2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_face_adjacency_matrix  (FoldEdgeSet overload — primary)
+// ─────────────────────────────────────────────────────────────────────────────
+
+Eigen::SparseMatrix<double>
+build_face_adjacency_matrix(const PaperMesh& mesh,
+                             const FoldEdgeSet& fold_edges,
+                             double dihedral_weight)
+{
+    int nF = static_cast<int>(mesh.n_faces());
+
+    using T = Eigen::Triplet<double>;
+    std::vector<T> trips;
+
+    for (auto eh : mesh.edges()) {
+        if (mesh.is_boundary(eh)) continue;
+        auto heh0 = mesh.halfedge_handle(eh,0);
+        auto heh1 = mesh.halfedge_handle(eh,1);
+        auto fh0  = mesh.face_handle(heh0);
+        auto fh1  = mesh.face_handle(heh1);
+        if (!fh0.is_valid() || !fh1.is_valid()) continue;
+
+        int fi = fh0.idx(), fj = fh1.idx();
+        double w = fold_edges.edge_indices.count(eh.idx()) ? dihedral_weight : 1.0;
+        trips.push_back({fi, fj, w});
+        trips.push_back({fj, fi, w});
+    }
+
+    Eigen::SparseMatrix<double> adj(nF, nF);
+    adj.setFromTriplets(trips.begin(), trips.end());
+    return adj;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_face_adjacency_matrix  (vector overload — kept for compatibility)
 // ─────────────────────────────────────────────────────────────────────────────
 
 Eigen::SparseMatrix<double>
@@ -64,6 +125,86 @@ build_face_adjacency_matrix(const PaperMesh& mesh,
     Eigen::SparseMatrix<double> adj(nF, nF);
     adj.setFromTriplets(trips.begin(), trips.end());
     return adj;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// build_local_face_adjacency
+// ─────────────────────────────────────────────────────────────────────────────
+
+Eigen::SparseMatrix<double>
+build_local_face_adjacency(const PaperMesh& mesh,
+                            const Patch& patch,
+                            const FoldEdgeSet& fold_edges,
+                            double dihedral_weight)
+{
+    int nLocal = static_cast<int>(patch.face_indices.size());
+    if (nLocal == 0) return Eigen::SparseMatrix<double>(0, 0);
+
+    // Map global face index -> local row index
+    std::unordered_map<int,int> global_to_local;
+    for (int i = 0; i < nLocal; i++)
+        global_to_local[patch.face_indices[i]] = i;
+
+    using T = Eigen::Triplet<double>;
+    std::vector<T> trips;
+
+    for (auto eh : mesh.edges()) {
+        if (mesh.is_boundary(eh)) continue;
+        auto heh0 = mesh.halfedge_handle(eh, 0);
+        auto heh1 = mesh.halfedge_handle(eh, 1);
+        auto fh0  = mesh.face_handle(heh0);
+        auto fh1  = mesh.face_handle(heh1);
+        if (!fh0.is_valid() || !fh1.is_valid()) continue;
+
+        int gfi = fh0.idx(), gfj = fh1.idx();
+        auto it0 = global_to_local.find(gfi);
+        auto it1 = global_to_local.find(gfj);
+        if (it0 == global_to_local.end() || it1 == global_to_local.end()) continue;
+
+        int li = it0->second, lj = it1->second;
+        double w = fold_edges.edge_indices.count(eh.idx()) ? dihedral_weight : 1.0;
+        trips.push_back({li, lj, w});
+        trips.push_back({lj, li, w});
+    }
+
+    Eigen::SparseMatrix<double> adj(nLocal, nLocal);
+    adj.setFromTriplets(trips.begin(), trips.end());
+    return adj;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// compute_fiedler_vector  (2nd eigenvector of the normalised graph Laplacian)
+// ─────────────────────────────────────────────────────────────────────────────
+
+Eigen::VectorXd
+compute_fiedler_vector(const Eigen::SparseMatrix<double>& adj)
+{
+    int n = adj.rows();
+    if (n < 2) return Eigen::VectorXd::Zero(n);
+
+    // Degree vector and D^{-1/2}
+    Eigen::VectorXd deg = Eigen::VectorXd::Zero(n);
+    for (int i = 0; i < n; i++)
+        for (Eigen::SparseMatrix<double>::InnerIterator it(adj, i); it; ++it)
+            deg[i] += it.value();
+
+    Eigen::VectorXd d_inv_sqrt(n);
+    for (int i = 0; i < n; i++)
+        d_inv_sqrt[i] = (deg[i] > 1e-12) ? 1.0 / std::sqrt(deg[i]) : 0.0;
+
+    // Normalised Laplacian L = I - D^{-1/2} A D^{-1/2}
+    Eigen::MatrixXd L = Eigen::MatrixXd::Identity(n, n);
+    for (int col = 0; col < adj.outerSize(); col++)
+        for (Eigen::SparseMatrix<double>::InnerIterator it(adj, col); it; ++it)
+            L(it.row(), col) -= d_inv_sqrt[it.row()] * it.value() * d_inv_sqrt[col];
+
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(L);
+    if (solver.info() != Eigen::Success || n < 2)
+        return Eigen::VectorXd::Zero(n);
+
+    // The Fiedler vector is the eigenvector for the 2nd smallest eigenvalue
+    // (index 1, since eigenvalues are sorted ascending by SelfAdjointEigenSolver)
+    return solver.eigenvectors().col(1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,17 +367,22 @@ int find_elbow(const std::vector<double>& distortions)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// segment_mesh
+// segment_mesh  — returns SegmentationResult
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::vector<Patch>
+SegmentationResult
 segment_mesh(const PaperMesh& mesh, const Config& cfg,
-             const std::vector<OpenMesh::EdgeHandle>& fold_edges)
+             const FoldEdgeSet& fold_edges)
 {
-    int nF = static_cast<int>(mesh.n_faces());
-    if (nF == 0) return {};
+    using Clock = std::chrono::high_resolution_clock;
+    auto t0 = Clock::now();
 
-    // Build adjacency
+    SegmentationResult result;
+
+    int nF = static_cast<int>(mesh.n_faces());
+    if (nF == 0) return result;
+
+    // Build adjacency using FoldEdgeSet overload
     auto adj = build_face_adjacency_matrix(mesh, fold_edges, cfg.dihedral_weight);
 
     // Determine number of patches
@@ -265,16 +411,23 @@ segment_mesh(const PaperMesh& mesh, const Config& cfg,
 
         int dim = std::min(k_target+1, static_cast<int>(embed.cols()));
         labels = kmeans_cluster(embed.leftCols(dim), k_target);
+
+        result.elbow_curve = distortions;
+        result.distortion_proxy_at_k = distortions[static_cast<size_t>(elbow_idx)];
     } else {
         int embed_dim = std::min(k_target+2, nF);
         Eigen::MatrixXd embed = compute_spectral_embedding(adj, embed_dim);
         int dim = std::min(k_target+1, static_cast<int>(embed.cols()));
         labels = kmeans_cluster(embed.leftCols(dim), k_target);
+        result.distortion_proxy_at_k = segmentation_distortion_proxy(mesh, labels, k_target);
     }
 
+    result.k_chosen    = k_target;
+    result.face_labels = labels;
+
     // Build Patch objects
-    // Map original vertex index → local vertex index per patch
-    std::unordered_map<int, std::vector<int>> patch_faces; // label → face indices
+    // Map original vertex index -> local vertex index per patch
+    std::unordered_map<int, std::vector<int>> patch_faces; // label -> face indices
     for (auto fh : mesh.faces()) {
         int fi = fh.idx();
         int lbl = (fi < static_cast<int>(labels.size())) ? labels[fi] : 0;
@@ -288,7 +441,7 @@ segment_mesh(const PaperMesh& mesh, const Config& cfg,
         p.face_indices = fids;
 
         // Collect unique vertices
-        std::unordered_map<int,int> vmap; // original → local
+        std::unordered_map<int,int> vmap; // original -> local
         for (int fi : fids) {
             auto fh = mesh.face_handle(fi);
             for (auto fv = mesh.cfv_begin(fh); fv != mesh.cfv_end(fh); ++fv) {
@@ -321,7 +474,11 @@ segment_mesh(const PaperMesh& mesh, const Config& cfg,
         patches.push_back(std::move(p));
     }
 
-    return patches;
+    result.patches = std::move(patches);
+
+    auto t1 = Clock::now();
+    result.elapsed_ms = std::chrono::duration<double, std::milli>(t1-t0).count();
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

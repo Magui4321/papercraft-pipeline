@@ -31,6 +31,12 @@ FetchContent_Declare(stb
     GIT_SHALLOW    TRUE)
 FetchContent_MakeAvailable(stb)
 
+FetchContent_Declare(Catch2
+    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+    GIT_TAG        v3.4.0
+    GIT_SHALLOW    TRUE)
+FetchContent_MakeAvailable(Catch2)
+
 file(GLOB SOURCES "src/*.cpp")
 
 add_executable(papercraft ${SOURCES})
@@ -55,6 +61,39 @@ target_link_libraries(papercraft PRIVATE
 if(OpenMP_CXX_FOUND)
     target_link_libraries(papercraft PRIVATE OpenMP::OpenMP_CXX)
 endif()
+
+# ── Test executable ──────────────────────────────────────────────────────────
+# Collect all src/*.cpp EXCEPT main.cpp for the test library
+file(GLOB LIB_SOURCES "src/*.cpp")
+list(FILTER LIB_SOURCES EXCLUDE REGEX "main\\.cpp$")
+
+add_executable(test_papercraft tests/test_math.cpp ${LIB_SOURCES})
+
+target_include_directories(test_papercraft PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${stb_SOURCE_DIR}
+)
+
+target_include_directories(test_papercraft SYSTEM PRIVATE
+    ${OPENMESH_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_papercraft PRIVATE
+    OpenMeshCore
+    OpenMeshTools
+    Eigen3::Eigen
+    nlohmann_json::nlohmann_json
+    Catch2::Catch2WithMain
+)
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(test_papercraft PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+include(CTest)
+list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
+include(Catch)
+catch_discover_tests(test_papercraft)
 
 install(TARGETS papercraft DESTINATION bin)
 
