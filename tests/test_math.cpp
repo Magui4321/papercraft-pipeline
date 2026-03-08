@@ -306,3 +306,83 @@ TEST_CASE("LSCM and ARAP handle coplanar geometry consistently")
     REQUIRE(distortion >= 0.0);
     REQUIRE(std::isfinite(distortion));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEST 4 — normalize_uv_area scales UV to match 3D surface area
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Verify that after calling normalize_uv_area, the total 2D UV area equals
+ * the total 3D surface area, and that a subsequent compute_arap_proxy call
+ * on a flat mesh returns a distortion close to zero.
+ *
+ * We use a single unit right-angle triangle:
+ *   V3: (0,0,0), (1,0,0), (0,1,0)  → area3D = 0.5
+ *   UV:  (0,0),  (0.1,0), (0,0.1) → area2D = 0.005  (deliberately wrong scale)
+ *
+ * After normalize_uv_area, area2D should equal area3D (= 0.5).
+ */
+TEST_CASE("normalize_uv_area scales UV to match 3D surface area")
+{
+    Eigen::MatrixXd V3(3, 3);
+    V3 << 0.0, 0.0, 0.0,
+          1.0, 0.0, 0.0,
+          0.0, 1.0, 0.0;
+
+    Eigen::MatrixXi F(1, 3);
+    F << 0, 1, 2;
+
+    // Deliberately mis-scaled UV (10× smaller than it should be)
+    Eigen::MatrixXd UV(3, 2);
+    UV << 0.0, 0.0,
+          0.1, 0.0,
+          0.0, 0.1;
+
+    // 3D area = 0.5
+    double area3d_expected = 0.5;
+
+    // 2D area before normalisation = 0.5 * |0.1*0.1 - 0*0| = 0.005
+    {
+        Eigen::Vector2d u0 = UV.row(1) - UV.row(0);
+        Eigen::Vector2d u1 = UV.row(2) - UV.row(0);
+        double area2d_before = 0.5 * std::abs(u0(0)*u1(1) - u0(1)*u1(0));
+        REQUIRE(area2d_before == Catch::Approx(0.005).margin(1e-10));
+    }
+
+    normalize_uv_area(V3, F, UV);
+
+    // After normalisation, 2D area must equal 3D area
+    {
+        Eigen::Vector2d u0 = UV.row(1) - UV.row(0);
+        Eigen::Vector2d u1 = UV.row(2) - UV.row(0);
+        double area2d_after = 0.5 * std::abs(u0(0)*u1(1) - u0(1)*u1(0));
+        REQUIRE(area2d_after == Catch::Approx(area3d_expected).margin(1e-8));
+    }
+
+    // For a flat mesh with matching areas the ARAP distortion must be ~0
+    double distortion = compute_arap_proxy(V3, F, UV);
+    REQUIRE(distortion == Catch::Approx(0.0).margin(1e-6));
+}
+
+/**
+ * Edge-case: normalize_uv_area must not modify UV when 2D area is zero.
+ */
+TEST_CASE("normalize_uv_area does not modify UV when 2D area is zero")
+{
+    Eigen::MatrixXd V3(3, 3);
+    V3 << 0.0, 0.0, 0.0,
+          1.0, 0.0, 0.0,
+          0.0, 1.0, 0.0;
+
+    Eigen::MatrixXi F(1, 3);
+    F << 0, 1, 2;
+
+    // Degenerate UV: all points collapsed to the origin → area2D = 0
+    Eigen::MatrixXd UV = Eigen::MatrixXd::Zero(3, 2);
+    Eigen::MatrixXd UV_original = UV;
+
+    normalize_uv_area(V3, F, UV);
+
+    // UV must remain unchanged
+    REQUIRE((UV - UV_original).norm() == Catch::Approx(0.0).margin(1e-15));
+}
