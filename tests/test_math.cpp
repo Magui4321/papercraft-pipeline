@@ -386,3 +386,84 @@ TEST_CASE("normalize_uv_area does not modify UV when 2D area is zero")
     // UV must remain unchanged
     REQUIRE((UV - UV_original).norm() == Catch::Approx(0.0).margin(1e-15));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEST 5 — count_boundaries correctly identifies boundary loops
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A flat open strip reports exactly one boundary loop.
+ * A cylindrical band (two open ends, with an intermediate interior ring so
+ * that the two boundaries are not directly edge-adjacent) reports two.
+ *
+ * Two-ring cylinder layout (12 vertices, 16 triangles):
+ *   Bottom ring (boundary): v0-v3
+ *   Middle ring (interior): v4-v7
+ *   Top    ring (boundary): v8-v11
+ */
+TEST_CASE("count_boundaries correctly identifies boundary loops")
+{
+    // ── Case 1: single flat open patch → 1 boundary loop ─────────────────
+    PaperMesh disk = make_mesh(
+        { {0,0,0}, {1,0,0}, {2,0,0}, {0,1,0}, {1,1,0} },
+        { {0,1,3}, {1,4,3}, {1,2,4} });
+
+    REQUIRE(count_boundaries(disk) == 1);
+
+    // ── Case 2: two-ring cylinder → 2 boundary loops ─────────────────────
+    PaperMesh cyl = make_mesh(
+        { {1,0,0},{0,1,0},{-1,0,0},{0,-1,0},      // bottom: v0-v3
+          {1,0,.5},{0,1,.5},{-1,0,.5},{0,-1,.5},   // middle: v4-v7
+          {1,0,1},{0,1,1},{-1,0,1},{0,-1,1} },     // top:    v8-v11
+        { // lower half (bottom -> middle)
+          {0,1,5},{0,5,4}, {1,2,6},{1,6,5}, {2,3,7},{2,7,6}, {3,0,4},{3,4,7},
+          // upper half (middle -> top)
+          {4,5,9},{4,9,8}, {5,6,10},{5,10,9}, {6,7,11},{6,11,10}, {7,4,8},{7,8,11} });
+
+    REQUIRE(count_boundaries(cyl) == 2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEST 6 — enforce_disk_topology merges two boundary loops into one
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * After enforce_disk_topology the two-ring cylinder must have exactly one
+ * boundary loop.  Every edge in the result must be shared by at most two
+ * faces (manifold condition), and all faces must have three distinct vertices.
+ */
+TEST_CASE("enforce_disk_topology merges two boundary loops into one")
+{
+    // Two-ring cylinder: bottom loop (v0-v3), interior ring (v4-v7),
+    // top loop (v8-v11).  Dijkstra finds a path through the interior ring.
+    PaperMesh cyl = make_mesh(
+        { {1,0,0},{0,1,0},{-1,0,0},{0,-1,0},
+          {1,0,.5},{0,1,.5},{-1,0,.5},{0,-1,.5},
+          {1,0,1},{0,1,1},{-1,0,1},{0,-1,1} },
+        { {0,1,5},{0,5,4}, {1,2,6},{1,6,5}, {2,3,7},{2,7,6}, {3,0,4},{3,4,7},
+          {4,5,9},{4,9,8}, {5,6,10},{5,10,9}, {6,7,11},{6,11,10}, {7,4,8},{7,8,11} });
+
+    REQUIRE(count_boundaries(cyl) == 2);
+
+    enforce_disk_topology(cyl);
+
+    REQUIRE(count_boundaries(cyl) == 1);
+
+    // Manifold check: no edge may have both half-edges on the boundary
+    for (auto eh : cyl.edges()) {
+        auto heh0 = cyl.halfedge_handle(eh, 0);
+        auto heh1 = cyl.halfedge_handle(eh, 1);
+        REQUIRE(!(cyl.is_boundary(heh0) && cyl.is_boundary(heh1)));
+    }
+
+    // All faces must have three distinct vertices
+    for (auto fh : cyl.faces()) {
+        std::vector<int> fverts;
+        for (auto fv : cyl.fv_range(fh))
+            fverts.push_back(fv.idx());
+        REQUIRE(fverts.size() == 3);
+        REQUIRE(fverts[0] != fverts[1]);
+        REQUIRE(fverts[1] != fverts[2]);
+        REQUIRE(fverts[0] != fverts[2]);
+    }
+}

@@ -24,6 +24,7 @@
 #include <iostream>
 #include <limits>
 #include <chrono>
+#include <unordered_map>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -258,6 +259,257 @@ void normalize_uv_area(const Eigen::MatrixXd& V3,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// count_boundaries
+// ─────────────────────────────────────────────────────────────────────────────
+
+int count_boundaries(PaperMesh& mesh)
+{
+    int count = 0;
+    std::set<int> visited; // visited halfedge indices
+    for (auto heh : mesh.halfedges()) {
+        if (!mesh.is_boundary(heh) || visited.count(heh.idx()))
+            continue;
+        ++count;
+        auto cur = heh;
+        do {
+            visited.insert(cur.idx());
+            cur = mesh.next_halfedge_handle(cur);
+        } while (cur != heh);
+    }
+    return count;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// enforce_disk_topology
+// ─────────────────────────────────────────────────────────────────────────────
+
+void enforce_disk_topology(PaperMesh& mesh)
+{
+    mesh.request_face_status();
+    mesh.request_edge_status();
+    mesh.request_vertex_status();
+
+    const int MAX_ITER = 20;
+    int iter = 0;
+
+    while (count_boundaries(mesh) > 1) {
+        if (++iter > MAX_ITER) {
+            log(LogLevel::WARNING,
+                "enforce_disk_topology: iteration limit reached, topology not fully fixed");
+            break;
+        }
+
+        // ── Step 1: identify Loop 0 and Loop 1 ───────────────────────────
+        std::vector<PaperMesh::VertexHandle> loop0_verts, loop1_verts;
+        {
+            std::set<int> visited_heh;
+            int loop_count = 0;
+            for (auto heh : mesh.halfedges()) {
+                if (!mesh.is_boundary(heh) || visited_heh.count(heh.idx()))
+                    continue;
+                std::vector<PaperMesh::VertexHandle> loop;
+                auto cur = heh;
+                do {
+                    visited_heh.insert(cur.idx());
+                    loop.push_back(mesh.from_vertex_handle(cur));
+                    cur = mesh.next_halfedge_handle(cur);
+                } while (cur != heh);
+                if (loop_count == 0)      loop0_verts = loop;
+                else { loop1_verts = loop; break; }
+                ++loop_count;
+            }
+        }
+
+        if (loop0_verts.empty() || loop1_verts.empty()) {
+            log(LogLevel::WARNING,
+                "enforce_disk_topology: could not identify two boundary loops");
+            break;
+        }
+
+        // ── Step 2: multi-source Dijkstra from Loop 0 → Loop 1 ───────────
+        int nV = static_cast<int>(mesh.n_vertices());
+        std::vector<double> dist(nV, std::numeric_limits<double>::infinity());
+        std::vector<int>    prev_vi(nV, -1);
+
+        using PDD = std::pair<double, int>;
+        std::priority_queue<PDD, std::vector<PDD>, std::greater<PDD>> pq;
+
+        std::set<int> loop1_set;
+        for (auto vh : loop1_verts) loop1_set.insert(vh.idx());
+
+        for (auto vh : loop0_verts) {
+            int vi = vh.idx();
+            if (dist[vi] == std::numeric_limits<double>::infinity()) {
+                dist[vi] = 0.0;
+                pq.push({0.0, vi});
+            }
+        }
+
+        int target_vi = -1;
+        while (!pq.empty()) {
+            auto [d, u] = pq.top(); pq.pop();
+            if (d > dist[u] + 1e-12) continue;
+            if (loop1_set.count(u)) { target_vi = u; break; }
+
+            auto vh_u = mesh.vertex_handle(u);
+            for (auto voh : mesh.voh_range(vh_u)) {
+                auto vh_v = mesh.to_vertex_handle(voh);
+                int  v    = vh_v.idx();
+                double w  = static_cast<double>(
+                    (mesh.point(vh_v) - mesh.point(vh_u)).length());
+                double nd = dist[u] + w;
+                if (nd < dist[v]) {
+                    dist[v]    = nd;
+                    prev_vi[v] = u;
+                    pq.push({nd, v});
+                }
+            }
+        }
+
+        if (target_vi < 0) {
+            log(LogLevel::WARNING,
+                "enforce_disk_topology: no path found between boundary loops");
+            break;
+        }
+
+        // Reconstruct path as a vector of vertex-handle indices
+        std::vector<int> path;
+        for (int v = target_vi; v >= 0; v = prev_vi[v])
+            path.push_back(v);
+        std::reverse(path.begin(), path.end());
+
+        if (static_cast<int>(path.size()) < 3) {
+            // No interior vertices to clone – degenerate path
+            log(LogLevel::WARNING,
+                "enforce_disk_topology: path too short to unzip (no interior vertices)");
+            break;
+        }
+
+        // ── Step 3: unzip along path ──────────────────────────────────────
+        // Build compact vertex and face arrays from current mesh state.
+        std::vector<std::array<float, 3>> V_arr;
+        std::vector<std::array<int,   3>> F_arr;
+        std::unordered_map<int, int> vid_map; // vertex handle idx → V_arr idx
+        std::unordered_map<int, int> fid_map; // face   handle idx → F_arr idx
+
+        V_arr.reserve(mesh.n_vertices());
+        for (auto vh : mesh.vertices()) {
+            vid_map[vh.idx()] = static_cast<int>(V_arr.size());
+            auto p = mesh.point(vh);
+            V_arr.push_back({p[0], p[1], p[2]});
+        }
+        F_arr.reserve(mesh.n_faces());
+        for (auto fh : mesh.faces()) {
+            fid_map[fh.idx()] = static_cast<int>(F_arr.size());
+            std::array<int, 3> f{};
+            int j = 0;
+            for (auto fv : mesh.fv_range(fh))
+                f[j++] = vid_map[fv.idx()];
+            F_arr.push_back(f);
+        }
+
+        // For each interior path vertex, determine which adjacent faces fall
+        // in the CCW sector from heh(v→next) to heh(v→prev) (exclusive).
+        // Those faces are "sideA" and will reference the cloned vertex.
+        // Only non-boundary interior vertices are cloned.
+
+        // First pass: collect sideA face sets per interior path vertex
+        std::unordered_map<int, std::set<int>> vtx_sideA; // V_arr idx → sideA F_arr idxs
+
+        for (int pi = 1; pi + 1 < static_cast<int>(path.size()); ++pi) {
+            int vi_orig = path[pi];
+            auto vh_i   = mesh.vertex_handle(vi_orig);
+
+            // Do not clone boundary vertices
+            if (mesh.is_boundary(vh_i)) continue;
+
+            auto vh_prev = mesh.vertex_handle(path[pi - 1]);
+            auto vh_next = mesh.vertex_handle(path[pi + 1]);
+
+            // Find outgoing half-edges from vh_i to vh_next and vh_prev
+            PaperMesh::HalfedgeHandle heh_to_next, heh_to_prev;
+            bool found_next = false, found_prev = false;
+            for (auto voh : mesh.voh_range(vh_i)) {
+                auto to = mesh.to_vertex_handle(voh);
+                if (to == vh_next) { heh_to_next = voh; found_next = true; }
+                if (to == vh_prev) { heh_to_prev = voh; found_prev = true; }
+            }
+            if (!found_next || !found_prev) continue;
+
+            // Walk CCW around vh_i starting from heh_to_next, stopping
+            // (exclusive) at heh_to_prev.  All faces encountered are sideA.
+            int orig_vi_arr = vid_map.at(vi_orig);
+            std::set<int>& sideA = vtx_sideA[orig_vi_arr];
+
+            auto heh        = heh_to_next;
+            int  max_steps  = static_cast<int>(mesh.valence(vh_i)) + 2;
+            for (int s = 0; s < max_steps; ++s) {
+                if (heh == heh_to_prev) break;
+                if (!mesh.is_boundary(heh)) {
+                    int fh_idx = mesh.face_handle(heh).idx();
+                    if (fid_map.count(fh_idx))
+                        sideA.insert(fid_map.at(fh_idx));
+                }
+                // CCW rotation around vh_i
+                heh = mesh.next_halfedge_handle(
+                          mesh.opposite_halfedge_handle(heh));
+            }
+        }
+
+        // Second pass: create clone vertices for path vertices that have a
+        // non-empty sideA (at least one face to reassign).
+        std::unordered_map<int, int> clone_map; // V_arr idx → clone V_arr idx
+        for (auto& [orig_vi_arr, sideA] : vtx_sideA) {
+            if (!sideA.empty()) {
+                clone_map[orig_vi_arr] = static_cast<int>(V_arr.size());
+                V_arr.push_back(V_arr[orig_vi_arr]);
+            }
+        }
+
+        if (clone_map.empty()) {
+            log(LogLevel::WARNING,
+                "enforce_disk_topology: no clonable interior vertices found on path");
+            break;
+        }
+
+        // Collect the union of all sideA face indices
+        std::set<int> sideA_all;
+        for (auto& [_, sideA] : vtx_sideA)
+            sideA_all.insert(sideA.begin(), sideA.end());
+
+        // Apply vertex replacement: all interior path vertices in sideA faces
+        // are replaced by their clones.
+        for (int fi : sideA_all) {
+            for (int& vi : F_arr[fi]) {
+                auto it = clone_map.find(vi);
+                if (it != clone_map.end())
+                    vi = it->second;
+            }
+        }
+
+        // Rebuild PaperMesh from modified arrays
+        PaperMesh new_mesh;
+        new_mesh.request_face_status();
+        new_mesh.request_edge_status();
+        new_mesh.request_vertex_status();
+
+        for (auto& v : V_arr)
+            new_mesh.add_vertex(PaperMesh::Point(v[0], v[1], v[2]));
+
+        for (auto& f : F_arr) {
+            // Skip degenerate faces with repeated vertex indices
+            if (f[0] == f[1] || f[1] == f[2] || f[0] == f[2]) continue;
+            auto vh0 = new_mesh.vertex_handle(f[0]);
+            auto vh1 = new_mesh.vertex_handle(f[1]);
+            auto vh2 = new_mesh.vertex_handle(f[2]);
+            new_mesh.add_face(vh0, vh1, vh2);
+        }
+
+        mesh = std::move(new_mesh);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // UnfoldingResult helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -411,6 +663,63 @@ UnfoldingResult unfold_patches(const PaperMesh& mesh,
         r.patch_id = patch.id;
         r.V = patch.V;
         r.F = patch.F;
+
+        // Step 0: enforce disk topology (single boundary loop) before LSCM.
+        // Build a temporary PaperMesh from the patch's V/F, fix topology,
+        // then extract updated V/F so LSCM receives a clean disk.
+        if (patch.V.rows() >= 3 && patch.F.rows() >= 1) {
+            PaperMesh patch_mesh;
+            patch_mesh.request_face_status();
+            patch_mesh.request_edge_status();
+            patch_mesh.request_vertex_status();
+
+            for (int vi = 0; vi < patch.V.rows(); ++vi)
+                patch_mesh.add_vertex(PaperMesh::Point(
+                    static_cast<float>(patch.V(vi, 0)),
+                    static_cast<float>(patch.V(vi, 1)),
+                    static_cast<float>(patch.V(vi, 2))));
+
+            for (int fi = 0; fi < patch.F.rows(); ++fi) {
+                auto vh0 = patch_mesh.vertex_handle(patch.F(fi, 0));
+                auto vh1 = patch_mesh.vertex_handle(patch.F(fi, 1));
+                auto vh2 = patch_mesh.vertex_handle(patch.F(fi, 2));
+                patch_mesh.add_face(vh0, vh1, vh2);
+            }
+
+            if (count_boundaries(patch_mesh) > 1) {
+                log(LogLevel::INFO,
+                    "enforce_disk_topology: patch " +
+                    std::to_string(patch.id) + " has " +
+                    std::to_string(count_boundaries(patch_mesh)) +
+                    " boundary loops — unzipping");
+                enforce_disk_topology(patch_mesh);
+
+                // Rebuild V and F from the modified mesh
+                int new_nV = static_cast<int>(patch_mesh.n_vertices());
+                int new_nF = static_cast<int>(patch_mesh.n_faces());
+                Eigen::MatrixXd newV(new_nV, 3);
+                Eigen::MatrixXi newF(new_nF, 3);
+
+                std::unordered_map<int,int> new_vid_map;
+                int idx = 0;
+                for (auto vh : patch_mesh.vertices()) {
+                    new_vid_map[vh.idx()] = idx;
+                    auto p = patch_mesh.point(vh);
+                    newV.row(idx) = Eigen::Vector3d(p[0], p[1], p[2]);
+                    ++idx;
+                }
+                int fidx = 0;
+                for (auto fh : patch_mesh.faces()) {
+                    int col = 0;
+                    for (auto fv : patch_mesh.fv_range(fh))
+                        newF(fidx, col++) = new_vid_map.at(fv.idx());
+                    ++fidx;
+                }
+
+                r.V = newV;
+                r.F = newF;
+            }
+        }
 
         // Step 1: attempt LSCM unfolding
         bool lscm_ok = false;

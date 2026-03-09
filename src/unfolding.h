@@ -92,6 +92,30 @@ void normalize_uv_area(const Eigen::MatrixXd& V3,
                         Eigen::MatrixXd& UV);
 
 /**
+ * @brief Count the number of distinct boundary loops in a mesh.
+ *
+ * Traverses half-edges to identify and count separate, continuous boundary
+ * loops. A topological disk has exactly one boundary loop (B=1).
+ *
+ * @param mesh  Input mesh (must have status attributes requested).
+ * @return Number of boundary loops.
+ */
+int count_boundaries(PaperMesh& mesh);
+
+/**
+ * @brief Enforce disk topology on a mesh by unzipping interior seams.
+ *
+ * If the mesh has more than one boundary loop, this function repeatedly
+ * finds the shortest path (by 3D edge length) between two distinct boundary
+ * loops and "unzips" the mesh along that path, duplicating interior vertices
+ * to merge the two loops into one. Iterates until a single boundary loop
+ * remains or a safety iteration limit is hit.
+ *
+ * @param mesh  Mesh to fix in-place. Must have status attributes requested.
+ */
+void enforce_disk_topology(PaperMesh& mesh);
+
+/**
  * @brief Main unfolding driver with Iterative Hierarchical Splitting.
  *
  * Implements a queue-based algorithm:
