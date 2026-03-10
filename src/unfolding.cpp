@@ -14,7 +14,6 @@
 #include <stb_image_write.h>
 #include <nlohmann/json.hpp>
 
-#include <igl/cut_to_disk.h>
 #include <igl/cut_mesh.h>
 
 #include <map>
@@ -23,6 +22,7 @@
 #include <fstream>
 #include <vector>
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -418,19 +418,129 @@ UnfoldingResult unfold_patches(const PaperMesh& mesh,
         // Step 1: attempt LSCM unfolding
         bool lscm_ok = false;
         if (patch.V.rows() >= 3 && patch.F.rows() >= 1) {
-            // ── Topological cut-to-disk: guarantee the patch is a disk before LSCM ──
+            // ── Curvature-Steered Cut Graph: steer seams into fold edges ──
             {
-                Eigen::MatrixXi cuts;
-                igl::cut_to_disk(patch.F, cuts);
-                if (cuts.rows() > 0) {
-                    Eigen::MatrixXd V_cut;
-                    Eigen::MatrixXi F_cut;
-                    igl::cut_mesh(patch.V, patch.F, cuts, V_cut, F_cut);
-                    patch.V = V_cut;
-                    patch.F = F_cut;
-                    // Also update the UnfoldResult's V and F to match the cut mesh
-                    r.V = patch.V;
-                    r.F = patch.F;
+                int nF_local = static_cast<int>(patch.F.rows());
+                if (nF_local > 1) {
+                    // --- Step A: Build face adjacency (dual graph) with fold-aware weights ---
+                    // Map: undirected primal edge (local vi, local vj) → list of face indices
+                    std::map<std::pair<int,int>, std::vector<int>> edge_to_faces;
+                    for (int fi = 0; fi < nF_local; ++fi) {
+                        for (int ei = 0; ei < 3; ++ei) {
+                            int v1 = patch.F(fi, ei);
+                            int v2 = patch.F(fi, (ei+1)%3);
+                            auto key = std::make_pair(std::min(v1, v2), std::max(v1, v2));
+                            edge_to_faces[key].push_back(fi);
+                        }
+                    }
+
+                    // Dual graph edges: (face_a, face_b, weight, primal_edge_key)
+                    // Fold edges get a much lower cut weight so MST prefers to connect
+                    // across them, leaving them as the cut graph (seam) candidates.
+                    constexpr double FOLD_EDGE_WEIGHT = 0.001;
+                    constexpr double REGULAR_EDGE_WEIGHT = 1.0;
+                    struct DualEdge {
+                        int face_a, face_b;
+                        double weight;
+                        std::pair<int,int> primal_edge; // local vertex indices
+                    };
+                    std::vector<DualEdge> dual_edges;
+
+                    for (auto& [edge_key, face_list] : edge_to_faces) {
+                        if (face_list.size() == 2) {
+                            // Determine weight: is this primal edge a fold edge?
+                            int local_v1 = edge_key.first;
+                            int local_v2 = edge_key.second;
+
+                            // Convert to global vertex indices
+                            int global_v1 = patch.vertex_indices[local_v1];
+                            int global_v2 = patch.vertex_indices[local_v2];
+
+                            // Look up the OpenMesh edge handle between these two global vertices
+                            bool is_fold = false;
+                            auto vh1 = mesh.vertex_handle(global_v1);
+                            auto vh2 = mesh.vertex_handle(global_v2);
+                            // Find the halfedge from vh1 to vh2
+                            auto heh = mesh.find_halfedge(vh1, vh2);
+                            if (heh.is_valid()) {
+                                int edge_idx = mesh.edge_handle(heh).idx();
+                                is_fold = (mesh_fold_edges.edge_indices.count(edge_idx) > 0);
+                            }
+
+                            double w = is_fold ? FOLD_EDGE_WEIGHT : REGULAR_EDGE_WEIGHT;
+                            dual_edges.push_back({face_list[0], face_list[1], w, edge_key});
+                        }
+                    }
+
+                    // --- Step B: Kruskal's MST on the dual graph ---
+                    // Sort dual edges by weight (ascending)
+                    std::sort(dual_edges.begin(), dual_edges.end(),
+                              [](const DualEdge& a, const DualEdge& b) { return a.weight < b.weight; });
+
+                    // Union-Find
+                    std::vector<int> parent(nF_local), rank_uf(nF_local, 0);
+                    std::iota(parent.begin(), parent.end(), 0);
+                    auto find_root = [&](int x) -> int {
+                        // Iterative path compression to avoid stack overflow on deep trees
+                        while (parent[x] != x) {
+                            parent[x] = parent[parent[x]]; // path halving
+                            x = parent[x];
+                        }
+                        return x;
+                    };
+                    auto unite = [&](int a, int b) -> bool {
+                        int ra = find_root(a), rb = find_root(b);
+                        if (ra == rb) return false;
+                        if (rank_uf[ra] < rank_uf[rb]) std::swap(ra, rb);
+                        parent[rb] = ra;
+                        if (rank_uf[ra] == rank_uf[rb]) rank_uf[ra]++;
+                        return true;
+                    };
+
+                    // Track which primal edges are in the MST
+                    std::set<std::pair<int,int>> mst_primal_edges;
+                    for (auto& de : dual_edges) {
+                        if (unite(de.face_a, de.face_b)) {
+                            mst_primal_edges.insert(de.primal_edge);
+                        }
+                    }
+
+                    // --- Step C: Cut graph = interior primal edges NOT in the MST ---
+                    std::set<std::pair<int,int>> cut_edges_set;
+                    for (auto& [edge_key, face_list] : edge_to_faces) {
+                        if (face_list.size() == 2) { // interior edge
+                            if (mst_primal_edges.find(edge_key) == mst_primal_edges.end()) {
+                                cut_edges_set.insert(edge_key);
+                            }
+                        }
+                    }
+
+                    // --- Step D: Build Fx3 boolean cut_mask for igl::cut_mesh ---
+                    if (!cut_edges_set.empty()) {
+                        Eigen::MatrixXi cut_mask = Eigen::MatrixXi::Zero(nF_local, 3);
+                        for (int fi = 0; fi < nF_local; ++fi) {
+                            for (int ei = 0; ei < 3; ++ei) {
+                                int v1 = patch.F(fi, ei);
+                                int v2 = patch.F(fi, (ei+1)%3);
+                                auto key = std::make_pair(std::min(v1, v2), std::max(v1, v2));
+                                if (cut_edges_set.count(key)) {
+                                    cut_mask(fi, ei) = 1;
+                                }
+                            }
+                        }
+
+                        Eigen::MatrixXd V_cut;
+                        Eigen::MatrixXi F_cut;
+                        igl::cut_mesh(patch.V, patch.F, cut_mask, V_cut, F_cut);
+                        patch.V = V_cut;
+                        patch.F = F_cut;
+                        r.V = patch.V;
+                        r.F = patch.F;
+
+                        std::cout << "[Stage 4] Curvature-steered cut: patch " << patch.id
+                                  << " cut " << cut_edges_set.size() << " edges ("
+                                  << mst_primal_edges.size() << " MST edges kept).\n";
+                    }
                 }
             }
             r.UV = lscm_eigen(patch.V, patch.F);
