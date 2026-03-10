@@ -37,6 +37,14 @@ FetchContent_Declare(Catch2
     GIT_SHALLOW    TRUE)
 FetchContent_MakeAvailable(Catch2)
 
+FetchContent_Declare(
+    libigl
+    GIT_REPOSITORY https://github.com/libigl/libigl.git
+    GIT_TAG v2.4.0
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(libigl)
+
 file(GLOB SOURCES "src/*.cpp")
 
 add_executable(papercraft ${SOURCES})
@@ -56,6 +64,7 @@ target_link_libraries(papercraft PRIVATE
     OpenMeshTools
     Eigen3::Eigen
     nlohmann_json::nlohmann_json
+    igl::core
 )
 
 if(OpenMP_CXX_FOUND)
@@ -84,6 +93,7 @@ target_link_libraries(test_papercraft PRIVATE
     Eigen3::Eigen
     nlohmann_json::nlohmann_json
     Catch2::Catch2WithMain
+    igl::core
 )
 
 if(OpenMP_CXX_FOUND)

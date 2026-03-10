@@ -14,6 +14,9 @@
 #include <stb_image_write.h>
 #include <nlohmann/json.hpp>
 
+#include <igl/cut_to_disk.h>
+#include <igl/cut_mesh.h>
+
 #include <map>
 #include <set>
 #include <queue>
@@ -415,6 +418,21 @@ UnfoldingResult unfold_patches(const PaperMesh& mesh,
         // Step 1: attempt LSCM unfolding
         bool lscm_ok = false;
         if (patch.V.rows() >= 3 && patch.F.rows() >= 1) {
+            // ── Topological cut-to-disk: guarantee the patch is a disk before LSCM ──
+            {
+                Eigen::MatrixXi cuts;
+                igl::cut_to_disk(patch.F, cuts);
+                if (cuts.rows() > 0) {
+                    Eigen::MatrixXd V_cut;
+                    Eigen::MatrixXi F_cut;
+                    igl::cut_mesh(patch.V, patch.F, cuts, V_cut, F_cut);
+                    patch.V = V_cut;
+                    patch.F = F_cut;
+                    // Also update the UnfoldResult's V and F to match the cut mesh
+                    r.V = patch.V;
+                    r.F = patch.F;
+                }
+            }
             r.UV = lscm_eigen(patch.V, patch.F);
             lscm_ok = (r.UV.rows() == patch.V.rows());
         }
